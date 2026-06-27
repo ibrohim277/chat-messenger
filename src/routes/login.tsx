@@ -287,7 +287,7 @@ onClick={async()=>{
 
 
 const res = await fetch(
-"http://localhost:5000/auth/send-code",
+"https://chat-messenger-server.onrender.com/auth/send-code",
 {
 
 method:"POST",
@@ -369,7 +369,7 @@ onClick={async()=>{
 
 
 const res = await fetch(
-"http://localhost:5000/auth/check-code",
+"https://chat-messenger-server.onrender.com/auth/check-code",
 {
 
 method:"POST",
@@ -456,7 +456,7 @@ onClick={async()=>{
 
 
 const res = await fetch(
-"http://localhost:5000/auth/reset-password",
+"https://chat-messenger-server.onrender.com/auth/reset-password",
 {
 
 method:"POST",
