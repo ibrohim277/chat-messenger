@@ -57,7 +57,10 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
       );
       return page;
     },
-    refetchOnWindowFocus: false,
+    // POLLING: socket ishlamasa ham 3 soniyada bir yangilanadi
+    refetchInterval: 3000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
 
   const roomQuery = useQuery({
@@ -87,22 +90,22 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     if (distance < 200) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
-  // Socket xonalariga ulanish qismi (String casting va har ikkala variant ta'minlandi)
+  // Room join
   useEffect(() => {
     if (!socket) return;
-    const rId = String(room.id);
-    
-    socket.emit("join_room", { roomId: rId });
-    socket.emit("joinRoom", { roomId: rId });
-    socket.emit("join_room", rId); // Qo'shimcha string variant xavfsizlik uchun
-    
+    const sRoomId = String(room.id);
+    socket.emit("join_room", { roomId: sRoomId });
+    socket.emit("joinRoom", { roomId: sRoomId });
+    socket.emit("join", { roomId: sRoomId });
+    socket.emit("subscribe", { roomId: sRoomId });
     return () => {
-      socket.emit("leave_room", { roomId: rId });
-      socket.emit("leaveRoom", { roomId: rId });
-      socket.emit("leave_room", rId);
+      socket.emit("leave_room", { roomId: sRoomId });
+      socket.emit("leaveRoom", { roomId: sRoomId });
+      socket.emit("leave", { roomId: sRoomId });
     };
   }, [socket, room.id]);
 
+  // Mark read
   useEffect(() => {
     if (!socket) return;
     const last = messages[messages.length - 1];
@@ -110,33 +113,36 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     socket.emit("mark_read", { roomId: String(room.id), messageId: last.id });
   }, [socket, room.id, messages]);
 
+  // Socket listeners — barcha mumkin bo'lgan event nomlarini tinglaydi
   useEffect(() => {
     if (!socket) return;
 
     const upsertMessage = (m: Message) => {
-      // ID turlarini string'ga o'girib solishtiramiz, xatolik ketmasligi uchun
-      if (String(m.roomId) !== String(room.id)) {
+      // roomId yo'q bo'lsa ham qabul qilamiz (ba'zi backendlar yubormasligi mumkin)
+      if (m.roomId && String(m.roomId) !== String(room.id)) {
         qc.invalidateQueries({ queryKey: ["rooms"] });
         return;
       }
-      
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         const items = prev?.items ?? [];
         if (items.some((x) => x.id === m.id)) return prev ?? { items: [m] };
-        return { ...prev, items: [...items, m] };
+        const sorted = [...items, m].sort(
+          (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        );
+        return { ...prev, items: sorted };
       });
       qc.invalidateQueries({ queryKey: ["rooms"] });
     };
 
     const updateMessage = (m: Message) => {
-      if (String(m.roomId) !== String(room.id)) return;
+      if (m.roomId && String(m.roomId) !== String(room.id)) return;
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         if (!prev) return prev;
         return { ...prev, items: prev.items.map((x) => (x.id === m.id ? { ...x, ...m } : x)) };
       });
     };
 
-    const removeMessage = (payload: { id: string; roomId?: string } | string) => {
+    const removeMessage = (payload: { id: string } | string) => {
       const id = typeof payload === "string" ? payload : payload.id;
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         if (!prev) return prev;
@@ -147,33 +153,25 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
       });
     };
 
-    const onTyping = (p: { userId: string; username?: string; displayName?: string; roomId: string }) => {
-      if (String(p.roomId) !== String(room.id) || p.userId === currentUser.id) return;
+    const onTyping = (p: { userId: string; username?: string; displayName?: string; roomId?: string }) => {
+      if (p.roomId && String(p.roomId) !== String(room.id)) return;
+      if (p.userId === currentUser.id) return;
       setTypingUsers((s) => ({ ...s, [p.userId]: p.displayName || p.username || "Foydalanuvchi" }));
       setTimeout(() => {
-        setTypingUsers((s) => {
-          const next = { ...s };
-          delete next[p.userId];
-          return next;
-        });
+        setTypingUsers((s) => { const next = { ...s }; delete next[p.userId]; return next; });
       }, 3500);
     };
 
-    const onStopTyping = (p: { userId: string; roomId: string }) => {
-      if (String(p.roomId) !== String(room.id)) return;
-      setTypingUsers((s) => {
-        const next = { ...s };
-        delete next[p.userId];
-        return next;
-      });
+    const onStopTyping = (p: { userId: string; roomId?: string }) => {
+      if (p.roomId && String(p.roomId) !== String(room.id)) return;
+      setTypingUsers((s) => { const next = { ...s }; delete next[p.userId]; return next; });
     };
 
-    const onReaction = (p: {
+    const onReactionAdded = (p: {
       messageId: string;
       reaction?: { userId: string; emoji: string };
       userId?: string;
       emoji?: string;
-      removed?: boolean;
     }) => {
       const userId = p.reaction?.userId ?? p.userId;
       const emoji = p.reaction?.emoji ?? p.emoji;
@@ -185,42 +183,100 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
           items: prev.items.map((m) => {
             if (m.id !== p.messageId) return m;
             const reactions = (m.reactions ?? []).filter((r) => !(r.userId === userId && r.emoji === emoji));
-            if (!p.removed) reactions.push({ messageId: m.id, userId, emoji });
+            reactions.push({ messageId: m.id, userId, emoji });
             return { ...m, reactions };
           }),
         };
       });
     };
 
-    // Backend barcha turlarda yuborishi mumkin bo'lgan asosiy event'lar tinglanadi
+    const onReactionRemoved = (p: {
+      messageId: string;
+      reaction?: { userId: string; emoji: string };
+      userId?: string;
+      emoji?: string;
+    }) => {
+      const userId = p.reaction?.userId ?? p.userId;
+      const emoji = p.reaction?.emoji ?? p.emoji;
+      if (!userId || !emoji) return;
+      qc.setQueryData<PageData>(messagesKey, (prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((m) => {
+            if (m.id !== p.messageId) return m;
+            const reactions = (m.reactions ?? []).filter((r) => !(r.userId === userId && r.emoji === emoji));
+            return { ...m, reactions };
+          }),
+        };
+      });
+    };
+
+    // Barcha mumkin bo'lgan xabar event nomlari
     socket.on("new_message", upsertMessage);
     socket.on("message", upsertMessage);
     socket.on("message_created", upsertMessage);
-    socket.on("receive_message", upsertMessage); // Ko'p ishlatiladigan muqobil event
+    socket.on("newMessage", upsertMessage);
+    socket.on("chat_message", upsertMessage);
+    socket.on("chatMessage", upsertMessage);
+
     socket.on("message_edited", updateMessage);
     socket.on("message_updated", updateMessage);
+    socket.on("messageUpdated", updateMessage);
+    socket.on("editMessage", updateMessage);
+
     socket.on("message_deleted", removeMessage);
+    socket.on("messageDeleted", removeMessage);
+    socket.on("deleteMessage", removeMessage);
+
     socket.on("typing", onTyping);
+    socket.on("userTyping", onTyping);
     socket.on("stop_typing", onStopTyping);
     socket.on("stopTyping", onStopTyping);
-    socket.on("reaction_added", (p: { messageId: string; userId: string; emoji: string }) => onReaction(p));
-    socket.on("reaction_removed", (p: { messageId: string; userId: string; emoji: string }) =>
-      onReaction({ ...p, removed: true }),
-    );
+    socket.on("userStopTyping", onStopTyping);
+
+    socket.on("reaction_added", onReactionAdded);
+    socket.on("reactionAdded", onReactionAdded);
+    socket.on("reaction_removed", onReactionRemoved);
+    socket.on("reactionRemoved", onReactionRemoved);
+
+    // DEBUG: qaysi event kelayotganini ko'rish uchun (keyinchalik olib tashlang)
+    const debugAny = (event: string, ...args: any[]) => {
+      if (event.toLowerCase().includes("message") || event.toLowerCase().includes("chat")) {
+        console.log("[SOCKET DEBUG]", event, args);
+      }
+    };
+    socket.onAny(debugAny);
 
     return () => {
       socket.off("new_message", upsertMessage);
       socket.off("message", upsertMessage);
       socket.off("message_created", upsertMessage);
-      socket.off("receive_message", upsertMessage);
+      socket.off("newMessage", upsertMessage);
+      socket.off("chat_message", upsertMessage);
+      socket.off("chatMessage", upsertMessage);
+
       socket.off("message_edited", updateMessage);
       socket.off("message_updated", updateMessage);
+      socket.off("messageUpdated", updateMessage);
+      socket.off("editMessage", updateMessage);
+
       socket.off("message_deleted", removeMessage);
+      socket.off("messageDeleted", removeMessage);
+      socket.off("deleteMessage", removeMessage);
+
       socket.off("typing", onTyping);
+      socket.off("userTyping", onTyping);
       socket.off("stop_typing", onStopTyping);
       socket.off("stopTyping", onStopTyping);
-      socket.off("reaction_added");
-      socket.off("reaction_removed");
+      socket.off("userStopTyping", onStopTyping);
+
+      socket.off("reaction_added", onReactionAdded);
+      socket.off("reactionAdded", onReactionAdded);
+      socket.off("reaction_removed", onReactionRemoved);
+      socket.off("reactionRemoved", onReactionRemoved);
+
+      socket.offAny(debugAny);
     };
   }, [socket, room.id, currentUser.id, qc, messagesKey]);
 
@@ -242,6 +298,8 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
         ...(replyTo && { replyToId: replyTo.id }),
       };
       const { data } = await api.post<Message>(`/rooms/${room.id}/messages`, payload);
+
+      // O'zimizning xabarimizni darhol ko'rsatamiz
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         const items = prev?.items ?? [];
         if (items.some((x) => x.id === data.id)) return prev ?? { items: [data] };
@@ -279,6 +337,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
         if (!prev) return prev;
         return { ...prev, items: prev.items.map((x) => (x.id === editing.id ? { ...x, ...data } : x)) };
       });
+      if (socket) socket.emit("message_edited", data);
       setEditing(null);
       qc.invalidateQueries({ queryKey: ["rooms"] });
     } catch (e) {
@@ -296,6 +355,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
           items: prev.items.map((x) => (x.id === m.id ? { ...x, isDeleted: true, content: "" } : x)),
         };
       });
+      if (socket) socket.emit("message_deleted", { id: m.id, roomId: String(room.id) });
     } catch (e) {
       toast.error(errorMessage(e, "O'chirib bo'lmadi"));
     }
@@ -345,7 +405,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
 
   return (
     <div className="flex h-full flex-1 flex-col bg-slate-50 dark:bg-zinc-950 relative overflow-hidden transition-colors duration-200">
-      
+
       {/* Header */}
       <div className="flex items-center gap-3 border-b border-zinc-200/80 dark:border-zinc-800/80 bg-white/90 dark:bg-zinc-900/90 backdrop-blur px-4 py-3 sticky top-0 z-20 shadow-sm">
         {onBack && (
@@ -353,7 +413,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
             <ArrowLeft size={18} />
           </button>
         )}
-        
+
         <button
           onClick={() => (otherUser ? setProfileUser(otherUser) : setShowInfo(true))}
           className="flex items-center gap-3 text-left group min-w-0 flex-1 focus:outline-none"
@@ -451,7 +511,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
         />
       </div>
 
-      {/* Custom Delete Confirmation Modal */}
+      {/* Delete Confirmation Modal */}
       {showDeleteConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-xs">
           <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 animate-in fade-in-50 zoom-in-95 duration-150">
@@ -459,8 +519,8 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
               {room.type === "PRIVATE" ? "Suhbatni o'chirish" : "Guruhni o'chirish"}
             </h3>
             <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">
-              {room.type === "PRIVATE" 
-                ? "Ushbu suhbatni o'chirmoqchimisiz? Ushbu amalni ortga qaytarib bo'lmaydi." 
+              {room.type === "PRIVATE"
+                ? "Ushbu suhbatni o'chirmoqchimisiz? Ushbu amalni ortga qaytarib bo'lmaydi."
                 : "Ushbu guruhni butunlay o'chirib tashlamoqchimisiz? Hamma a'zolar va xabarlar o'chib ketadi."}
             </p>
             <div className="mt-4 flex justify-end gap-2">
@@ -497,10 +557,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
           onMemberRemoved={(userId) => {
             qc.setQueryData(["room", room.id], (prev: any) => {
               if (!prev) return prev;
-              return {
-                ...prev,
-                members: prev.members?.filter((m: any) => m.userId !== userId),
-              };
+              return { ...prev, members: prev.members?.filter((m: any) => m.userId !== userId) };
             });
             qc.invalidateQueries({ queryKey: ["room", room.id] });
             qc.invalidateQueries({ queryKey: ["room-members", room.id] });
@@ -511,17 +568,8 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
   );
 }
 
-// ─────────────────────────────────────────────
-// MessagesList
-// ─────────────────────────────────────────────
 function MessagesList({
-  messages,
-  currentUserId,
-  isGroup,
-  onReply,
-  onEdit,
-  onDelete,
-  onReact,
+  messages, currentUserId, isGroup, onReply, onEdit, onDelete, onReact,
 }: {
   messages: Message[];
   currentUserId: string;
@@ -553,8 +601,6 @@ function MessagesList({
     }
     const time = new Date(m.createdAt).getTime();
     const sameSender = m.senderId === lastSenderId && time - lastTime < 5 * 60 * 1000;
-    const showAvatar = !sameSender;
-    const showName = !sameSender && isGroup;
     const isOwn = m.senderId === currentUserId;
 
     elements.push(
@@ -562,8 +608,8 @@ function MessagesList({
         key={m.id}
         message={m}
         isOwn={isOwn}
-        showAvatar={showAvatar}
-        showName={showName}
+        showAvatar={!sameSender}
+        showName={!sameSender && isGroup}
         isGroup={isGroup}
         onReply={onReply}
         onEdit={onEdit}
@@ -578,15 +624,8 @@ function MessagesList({
   return <>{elements}</>;
 }
 
-// ─────────────────────────────────────────────
-// GroupInfoDrawer
-// ─────────────────────────────────────────────
 function GroupInfoDrawer({
-  room,
-  currentUser,
-  onClose,
-  onPickUser,
-  onMemberRemoved,
+  room, currentUser, onClose, onPickUser, onMemberRemoved,
 }: {
   room: Room;
   currentUser: User;
@@ -602,13 +641,10 @@ function GroupInfoDrawer({
 
   const handleRemoveMember = async () => {
     if (!memberToConfirmRemove) return;
-    
     const targetUserId = memberToConfirmRemove.userId;
     const targetUserName = memberToConfirmRemove.user.displayName || memberToConfirmRemove.user.username;
-
     setRemovingId(targetUserId);
     setMemberToConfirmRemove(null);
-    
     try {
       await api.delete(`/rooms/${room.id}/members/${targetUserId}`);
       onMemberRemoved(targetUserId);
@@ -623,11 +659,7 @@ function GroupInfoDrawer({
   return (
     <>
       <div className="fixed inset-0 z-40 flex justify-end bg-black/40 backdrop-blur-xs animate-in fade-in duration-200" onClick={onClose}>
-        <div
-          className="h-full w-full max-w-sm overflow-y-auto border-l border-zinc-200/80 dark:border-zinc-800/80 bg-white dark:bg-zinc-900 p-5 shadow-2xl animate-in slide-in-from-right duration-200 flex flex-col"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {/* Drawer Header */}
+        <div className="h-full w-full max-w-sm overflow-y-auto border-l border-zinc-200/80 dark:border-zinc-800/80 bg-white dark:bg-zinc-900 p-5 shadow-2xl animate-in slide-in-from-right duration-200 flex flex-col" onClick={(e) => e.stopPropagation()}>
           <div className="flex items-center justify-between pb-3 border-b border-zinc-100 dark:border-zinc-800 mb-5">
             <h2 className="text-sm font-semibold text-zinc-800 dark:text-zinc-200 flex items-center gap-2">
               <Users size={16} className="text-primary" /> Guruh ma'lumotlari
@@ -637,7 +669,6 @@ function GroupInfoDrawer({
             </button>
           </div>
 
-          {/* Group Info Body */}
           <div className="mb-6 flex flex-col items-center gap-2.5 text-center bg-slate-50 dark:bg-zinc-950 p-4 rounded-2xl border border-zinc-100 dark:border-zinc-800/50 shadow-inner">
             <Avatar user={null} name={room.name ?? "Guruh"} size={72} className="shadow-md" />
             <div className="min-w-0 w-full">
@@ -651,50 +682,29 @@ function GroupInfoDrawer({
             )}
           </div>
 
-          {/* Members List Container */}
           <div className="space-y-2 flex-1 overflow-y-auto scrollbar-none">
             <div className="px-1 text-[10px] font-bold tracking-wider text-zinc-400 dark:text-zinc-500 uppercase flex items-center justify-between">
               <span>A'zolar ro'yxati</span>
               <span className="bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded-md text-[9px] lowercase font-normal">{room.members?.length ?? 0} a'zo</span>
             </div>
-            
             <div className="space-y-1">
               {room.members?.map((m) => (
-                <div
-                  key={m.userId}
-                  className="group flex w-full items-center gap-3 rounded-xl px-2 py-2 hover:bg-slate-50 dark:hover:bg-zinc-800/40 border border-transparent hover:border-zinc-100 dark:hover:border-zinc-800/30 transition-all duration-150"
-                >
-                  <button
-                    onClick={() => onPickUser(m.user)}
-                    className="flex min-w-0 flex-1 items-center gap-3 text-left focus:outline-none"
-                  >
+                <div key={m.userId} className="group flex w-full items-center gap-3 rounded-xl px-2 py-2 hover:bg-slate-50 dark:hover:bg-zinc-800/40 border border-transparent hover:border-zinc-100 dark:hover:border-zinc-800/30 transition-all duration-150">
+                  <button onClick={() => onPickUser(m.user)} className="flex min-w-0 flex-1 items-center gap-3 text-left focus:outline-none">
                     <Avatar user={m.user} size={36} showStatus online={m.user.status === "ONLINE"} />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-xs font-semibold text-zinc-800 dark:text-zinc-200">
-                        {m.user.displayName || m.user.username}
-                      </div>
+                      <div className="truncate text-xs font-semibold text-zinc-800 dark:text-zinc-200">{m.user.displayName || m.user.username}</div>
                       <div className="truncate text-[10px] text-zinc-400 dark:text-zinc-500">@{m.user.username}</div>
                     </div>
                   </button>
-
                   {m.role !== "MEMBER" && (
                     <span className="shrink-0 flex items-center gap-0.5 rounded-md bg-primary/10 px-2 py-0.5 text-[9px] font-bold text-primary tracking-wide uppercase">
                       <Shield size={8} /> {m.role}
                     </span>
                   )}
-
                   {canRemove && m.userId !== currentUser.id && m.role !== "OWNER" && (
-                    <button
-                      onClick={() => setMemberToConfirmRemove(m)}
-                      disabled={removingId === m.userId}
-                      title="Guruhdan o'chirish"
-                      className="shrink-0 rounded-lg p-1.5 text-zinc-400 md:opacity-0 group-hover:opacity-100 transition hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-950/40 dark:hover:text-red-400 focus:opacity-100"
-                    >
-                      {removingId === m.userId ? (
-                        <Loader2 size={14} className="animate-spin" />
-                      ) : (
-                        <LogOut size={14} />
-                      )}
+                    <button onClick={() => setMemberToConfirmRemove(m)} disabled={removingId === m.userId} title="Guruhdan o'chirish" className="shrink-0 rounded-lg p-1.5 text-zinc-400 md:opacity-0 group-hover:opacity-100 transition hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-950/40 dark:hover:text-red-400 focus:opacity-100">
+                      {removingId === m.userId ? <Loader2 size={14} className="animate-spin" /> : <LogOut size={14} />}
                     </button>
                   )}
                 </div>
@@ -704,30 +714,21 @@ function GroupInfoDrawer({
         </div>
       </div>
 
-      {/* Custom Member Remove Confirmation Modal */}
       {memberToConfirmRemove && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-xs">
           <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-xl dark:bg-zinc-900 border border-zinc-100 dark:border-zinc-800 animate-in fade-in-50 zoom-in-95 duration-150">
             <div className="flex items-center gap-2 text-red-500 mb-2">
               <UserMinus size={20} />
-              <h3 className="text-base font-semibold text-zinc-900 dark:text-white">
-                A'zoni chetlatish
-              </h3>
+              <h3 className="text-base font-semibold text-zinc-900 dark:text-white">A'zoni chetlatish</h3>
             </div>
             <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-relaxed">
               Haqiqatdan ham <span className="font-semibold text-zinc-800 dark:text-zinc-200">{memberToConfirmRemove.user.displayName || memberToConfirmRemove.user.username}</span> guruhdan chiqarilsinmi?
             </p>
             <div className="mt-4 flex justify-end gap-2">
-              <button
-                onClick={() => setMemberToConfirmRemove(null)}
-                className="rounded-xl px-4 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800 transition"
-              >
+              <button onClick={() => setMemberToConfirmRemove(null)} className="rounded-xl px-4 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800 transition">
                 Bekor qilish
               </button>
-              <button
-                onClick={handleRemoveMember}
-                className="flex items-center gap-1.5 rounded-xl bg-red-500 px-4 py-2 text-xs font-medium text-white hover:bg-red-600 transition shadow-sm shadow-red-500/10"
-              >
+              <button onClick={handleRemoveMember} className="flex items-center gap-1.5 rounded-xl bg-red-500 px-4 py-2 text-xs font-medium text-white hover:bg-red-600 transition shadow-sm shadow-red-500/10">
                 Chiqarish
               </button>
             </div>
