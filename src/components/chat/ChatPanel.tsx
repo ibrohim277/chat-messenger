@@ -87,13 +87,19 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     if (distance < 200) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
+  // Socket xonalariga ulanish qismi (String casting va har ikkala variant ta'minlandi)
   useEffect(() => {
     if (!socket) return;
-    socket.emit("join_room", { roomId: room.id });
-    socket.emit("joinRoom", { roomId: room.id });
+    const rId = String(room.id);
+    
+    socket.emit("join_room", { roomId: rId });
+    socket.emit("joinRoom", { roomId: rId });
+    socket.emit("join_room", rId); // Qo'shimcha string variant xavfsizlik uchun
+    
     return () => {
-      socket.emit("leave_room", { roomId: room.id });
-      socket.emit("leaveRoom", { roomId: room.id });
+      socket.emit("leave_room", { roomId: rId });
+      socket.emit("leaveRoom", { roomId: rId });
+      socket.emit("leave_room", rId);
     };
   }, [socket, room.id]);
 
@@ -101,17 +107,19 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     if (!socket) return;
     const last = messages[messages.length - 1];
     if (!last) return;
-    socket.emit("mark_read", { roomId: room.id, messageId: last.id });
+    socket.emit("mark_read", { roomId: String(room.id), messageId: last.id });
   }, [socket, room.id, messages]);
 
   useEffect(() => {
     if (!socket) return;
 
     const upsertMessage = (m: Message) => {
-      if (m.roomId !== room.id) {
+      // ID turlarini string'ga o'girib solishtiramiz, xatolik ketmasligi uchun
+      if (String(m.roomId) !== String(room.id)) {
         qc.invalidateQueries({ queryKey: ["rooms"] });
         return;
       }
+      
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         const items = prev?.items ?? [];
         if (items.some((x) => x.id === m.id)) return prev ?? { items: [m] };
@@ -121,13 +129,14 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     };
 
     const updateMessage = (m: Message) => {
+      if (String(m.roomId) !== String(room.id)) return;
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         if (!prev) return prev;
         return { ...prev, items: prev.items.map((x) => (x.id === m.id ? { ...x, ...m } : x)) };
       });
     };
 
-    const removeMessage = (payload: { id: string } | string) => {
+    const removeMessage = (payload: { id: string; roomId?: string } | string) => {
       const id = typeof payload === "string" ? payload : payload.id;
       qc.setQueryData<PageData>(messagesKey, (prev) => {
         if (!prev) return prev;
@@ -139,7 +148,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     };
 
     const onTyping = (p: { userId: string; username?: string; displayName?: string; roomId: string }) => {
-      if (p.roomId !== room.id || p.userId === currentUser.id) return;
+      if (String(p.roomId) !== String(room.id) || p.userId === currentUser.id) return;
       setTypingUsers((s) => ({ ...s, [p.userId]: p.displayName || p.username || "Foydalanuvchi" }));
       setTimeout(() => {
         setTypingUsers((s) => {
@@ -151,7 +160,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     };
 
     const onStopTyping = (p: { userId: string; roomId: string }) => {
-      if (p.roomId !== room.id) return;
+      if (String(p.roomId) !== String(room.id)) return;
       setTypingUsers((s) => {
         const next = { ...s };
         delete next[p.userId];
@@ -183,9 +192,11 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
       });
     };
 
+    // Backend barcha turlarda yuborishi mumkin bo'lgan asosiy event'lar tinglanadi
     socket.on("new_message", upsertMessage);
     socket.on("message", upsertMessage);
     socket.on("message_created", upsertMessage);
+    socket.on("receive_message", upsertMessage); // Ko'p ishlatiladigan muqobil event
     socket.on("message_edited", updateMessage);
     socket.on("message_updated", updateMessage);
     socket.on("message_deleted", removeMessage);
@@ -201,6 +212,7 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
       socket.off("new_message", upsertMessage);
       socket.off("message", upsertMessage);
       socket.off("message_created", upsertMessage);
+      socket.off("receive_message", upsertMessage);
       socket.off("message_edited", updateMessage);
       socket.off("message_updated", updateMessage);
       socket.off("message_deleted", removeMessage);
@@ -218,8 +230,8 @@ export function ChatPanel({ room, currentUser, onRoomDeleted, onBack }: Props) {
     const now = Date.now();
     if (now - lastTypingSentAt.current < 2000) return;
     lastTypingSentAt.current = now;
-    socket.emit("typing", { roomId: room.id });
-    setTimeout(() => socket.emit("stop_typing", { roomId: room.id }), 3000);
+    socket.emit("typing", { roomId: String(room.id) });
+    setTimeout(() => socket.emit("stop_typing", { roomId: String(room.id) }), 3000);
   }, [socket, room.id]);
 
   const sendMessage = async (content: string) => {
@@ -595,7 +607,7 @@ function GroupInfoDrawer({
     const targetUserName = memberToConfirmRemove.user.displayName || memberToConfirmRemove.user.username;
 
     setRemovingId(targetUserId);
-    setMemberToConfirmRemove(null); // Modalni darhol yopish
+    setMemberToConfirmRemove(null);
     
     try {
       await api.delete(`/rooms/${room.id}/members/${targetUserId}`);
