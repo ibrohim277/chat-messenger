@@ -1,7 +1,7 @@
 import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
 
-export const API_BASE_URL = "https://chat-backend-4wmg.onrender.com";
-export const WS_URL = "https://chat-backend-4wmg.onrender.com/chat";
+export const API_BASE_URL = "https://chat-backend-3-pt90.onrender.com";
+export const WS_URL = "https://chat-backend-3-pt90.onrender.com/chat";
 
 const ACCESS_KEY = "chat.accessToken";
 const REFRESH_KEY = "chat.refreshToken";
